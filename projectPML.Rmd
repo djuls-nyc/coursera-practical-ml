@@ -1,0 +1,140 @@
+---
+title: "Quantifying physical exercise quality through Machine Learning"
+author: "djuls-nyc"
+date: "March 14, 2016"
+output: html_document
+---
+
+#Overview: assignment description
+__Practical Machine Learning Course Project__  
+In this study, 6 participants performed barbell lifts correctly and incorrectly in 5 different ways. Data from accelerometers on the belt, forearm, arm, and dumbell of the participants were recorded and will be used to train machine learning models that can predict which of the 5 different ways the exercise is performed.  
+## Loading libraries
+```{r}
+# Loading useful libraries
+library(caret)
+library(AppliedPredictiveModeling)
+library(rpart)
+library(randomForest)
+library(xgboost)
+```
+#Exploratory data analysis and cleaning
+## Loading, splitting and cleaning the data
+```{r}
+# We need to make sure unavailable data is identified correctly
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",na.strings=c("NA","#DIV/0!",""))
+set.seed(2016)  # for reproductibility
+# Split in training (60%) and testing (40%) sets
+tr_idx <- createDataPartition(training$classe, p=0.6, list=FALSE)
+testing <- training[-tr_idx, ]
+training <- training[tr_idx, ]
+# Keep only training data from accelerometers
+training <- training[, -c(1:7)]
+# Remove near zero variance variables
+nzv <- nearZeroVar(training)
+training <- training[, -nzv]
+```
+Do we have missing data ?
+```{r}
+complete <- complete.cases(training)
+sum(complete)/length(complete)
+table(rowSums(is.na(training)))
+```
+It looks like we only have a handful (1%) of complete observations and that 69 variables are heavily missing (in over 95% of the observations). Let's remove those variables as they add little to no information.
+```{r}
+var_na <- which(colSums(is.na(training)) > 0.9*dim(training)[1])
+training <- training[, -var_na]
+table(rowSums(is.na(training)))
+```
+Nothing is missing anymore.  
+
+## Looking at the data
+53 variables are now available, including the output $classe$ which specifies how the exercise was performed. 
+```{r}
+table(training$classe)/length(training$classe)
+```
+It appears that A is a bit more frequent (28%) than the other $classe$ (16 to 20%) but none of them is under-represented.
+Let's try to plot the distribution of all those variables, for each $classe$.
+```{r}
+transparentTheme(trans = .9)
+sub4plot <- sample(dim(training)[1], 1000) # reduce computation
+featurePlot(x = training[sub4plot , -53],
+                  y = training$classe[sub4plot],
+                  plot = "density",
+                  scales = list(x = list(relation="free"),
+                                y = list(relation="free")),
+                  adjust = 1.5,
+                  pch = "|",
+                  auto.key = list(columns = 5))
+```
+  
+It is difficult to draw conclusions from so many variables (note: the plot is much easier to see when zooming in RStudio !), but we can spot that some variables might be useful in the classification: for instance gyros_arm_y as a predictor of A, and magnet_arm_x as a predictor of D vs A.  
+Let's have a look at the correlation between all those variables.
+```{r}
+length(findCorrelation(cor(training[,-53]), cutoff=0.8))
+```
+$findCorrelation$ suggests we could remove 13 variables that are highly correlated with the others.
+Since this mumber is not that high and since we will perform classification with trees, we can first try to keep them  and decide later upon performance and runtime needed for the models.  
+
+# Building Machine Learning Models
+We will need to use models that can perform multiclass classification. We have chosen to use the CART model as it seems to be a good basic Decision Tree used in ML classes, as well as two of the highest performing models used in machine learning competition: Random Forests and Boosting (xgboost implementation).  
+Note that we will not use the caret's train function as it seems to slowdown computation.  
+
+## CART
+```{r}
+model_rpart <- rpart(classe ~ ., data=training, method="class")
+pred_rpart <- predict(model_rpart, testing, type = "class")
+confusionMatrix(pred_rpart, testing$classe)
+```
+## RANDOM FORESTS
+```{r}
+model_rf <- randomForest(classe ~ ., data=training)
+pred_rf<- predict(model_rf, newdata= testing)
+confusionMatrix(pred_rf, testing$classe)
+```
+## XGBOOST
+The data needs to be prepared a bit differently in order to be used by $xgboost$. The training and testing sets need to be stored as numeric matrices, including the classes to be predicted (5 classes: from 0 to 4).
+We will ensure the data is not stored in lists anymore by setting the storage $mode$.
+```{r}
+# align processing to testing set to remove non-numeric var
+test_boost <- testing
+test_boost <- test_boost[, -c(1:7)]
+test_boost <- test_boost[, -nzv]
+test_boost <- test_boost[, -var_na]
+train_boost <- training
+
+classe_labels <- levels(training$classe)
+classe_train <- as.integer(training$classe)-1
+classe_test <- test_boost$classe
+train_boost$classe <- NULL
+test_boost$classe <- NULL
+
+train_boost <- as.matrix(train_boost); mode(train_boost) <- "numeric"
+test_boost <- as.matrix(test_boost); mode(test_boost) <- "numeric" 
+```
+Parameters for $xgboost$ are set for multiclass classification. The number of iterations has been arbitrarily set to 200, and can be changed to improve accuracy or lower overfit.
+```{r}
+par <- list("objective" = "multi:softprob", "num_class" = 5,
+            "eval_metric" = "merror")
+model_xgb <- xgboost(params=par, 
+                     data=train_boost, label=classe_train ,
+                     nrounds= 200,
+                     verbose=FALSE)
+```
+The $predict$ function used with $xgboost$ does not return the predicted classes, but a long vector of probabities for each class, so some post-processing needed here:
+```{r}
+prob_xgb <-  t(matrix(predict(model_xgb, newdata= test_boost), nrow=5))
+pred_xgb<- as.factor(classe_labels[max.col(prob_xgb)])
+confusionMatrix(pred_xgb, classe_test)
+```
+## Discussion and out-of-sample errors
+RANDOM FORESTS and XGBOOST performed extremely well right out of the box (default values were kept), having both an accuracy over 99% on the test set, which was way above the CART model. 
+__Those accuracies were computed on a test set not used during training__.  
+Considering the high performance and the reasonable computation time, we see no value in trying to reduce the number of features (high correlations, PCA...).
+
+# Generating the quizz predictions
+For the sake of simplicity, we will use the Random Forests model, as we don't need any additional processing and performance is very similar to xgboost:
+```{r}
+quizzing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",na.strings=c("NA","#DIV/0!",""))
+predict(model_rf, newdata= quizzing)
+```
+
